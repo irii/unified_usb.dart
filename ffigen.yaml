@@ -1,0 +1,75 @@
+# Not run directly (`dart run ffigen --config ffigen.yaml`) — this repo
+# doesn't vendor/redistribute libusb.h (see THIRD_PARTY_NOTICES.md), so
+# there's no fixed header path to put here. Regenerate the bindings via:
+#   dart run tool/generate_bindings.dart --libusb-include=/path/to/include
+# (or the LIBUSB_INCLUDE env var). That script loads this config and adds
+# the entry-point for the libusb.h it was pointed at before generating; the
+# placeholder path below is never actually read.
+name: LibUsbBindings
+description: |
+  Generated bindings for libusb-1.0 (https://libusb.info), used as the
+  low-level layer under the native `UsbBackend`/`UsbDevice` implementation.
+output: 'lib/src/native/libusb_bindings.g.dart'
+
+headers:
+  entry-points: [] # populated by tool/generate_bindings.dart
+  include-directives:
+    - '**libusb.h'
+
+compiler-opts: []
+
+functions:
+  include:
+    - 'libusb_.*'
+
+structs:
+  include:
+    - 'libusb_.*'
+
+unions:
+  include:
+    - 'libusb_.*'
+
+enums:
+  include:
+    - 'libusb_.*'
+  as-int:
+    include:
+      - '.*'
+
+silence-enum-warning: true
+
+macros:
+  include:
+    - 'LIBUSB_.*'
+
+globals:
+  include:
+    - 'libusb_.*'
+
+typedefs:
+  include:
+    - 'libusb_.*'
+    - 'ssize_t'
+
+type-map:
+  typedefs:
+    'ssize_t':
+      lib: 'ffi'
+      c-type: 'IntPtr'
+      dart-type: 'int'
+
+# Do not copy doc comments from libusb.h into the generated bindings: that
+# header is LGPL-2.1, and copying its prose into this MIT-licensed repo (and
+# redistributing it) would create a license conflict. Only the (non-copyright-
+# able) function signatures and constants are generated.
+comments: false
+
+preamble: |
+  // ignore_for_file: always_specify_types
+  // ignore_for_file: camel_case_types
+  // ignore_for_file: non_constant_identifier_names
+  // ignore_for_file: constant_identifier_names
+  // ignore_for_file: unused_field
+
+sort: true
