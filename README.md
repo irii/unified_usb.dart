@@ -11,6 +11,9 @@ A unified USB API for Dart — works both natively (desktop/CLI, via libusb) and
 - Control, bulk, and interrupt transfers
 - One codebase, two backends: native (libusb) and web (WebUSB)
 
+## TODO's before pub release
+- Async libusb implementation
+
 ## Regenerating native bindings
 
 Only needed if you're changing the native backend itself. Point the generator
