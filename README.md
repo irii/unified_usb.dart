@@ -11,6 +11,20 @@ A unified USB API for Dart — works both natively (desktop/CLI, via libusb) and
 - Control, bulk, and interrupt transfers
 - One codebase, two backends: native (libusb) and web (WebUSB)
 
+## Native transfer mode
+
+`NativeUsbBackend` runs bulk transfers synchronously by default: each
+`transferIn` / `transferOut` blocks the calling isolate in a native libusb
+call until it completes or hits its timeout (`readTimeout` / `writeTimeout` /
+`controlTimeout`, 5s each by default). An idle read therefore stalls the whole
+isolate for the full `readTimeout`.
+
+Pass `transferMode: UsbTransferMode.asyncEvents` to run bulk transfers through
+libusb's asynchronous API on a dedicated helper isolate instead - the calling
+isolate only `await`s and never blocks in native code, similar to WebUSB. Call
+`backend.dispose()` when finished so the helper isolate is torn down. Control
+transfers remain synchronous in both modes.
+
 ## Regenerating native bindings
 
 Only needed if you're changing the native backend itself. Point the generator

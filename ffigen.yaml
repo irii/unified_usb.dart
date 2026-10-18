@@ -5,6 +5,12 @@
 # (or the LIBUSB_INCLUDE env var). That script loads this config and adds
 # the entry-point for the libusb.h it was pointed at before generating; the
 # placeholder path below is never actually read.
+#
+# NOTE: ffigen emits `struct libusb_transfer` as opaque (flexible array
+# member). The async transfer path needs its fields, so its layout is
+# hand-written in lib/src/native/libusb_transfer_struct.dart and guarded by
+# test/libusb_transfer_layout_test.dart. Regenerating won't change that -
+# keep the hand-written struct authoritative.
 name: LibUsbBindings
 description: |
   Generated bindings for libusb-1.0 (https://libusb.info), used as the

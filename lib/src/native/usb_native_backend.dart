@@ -5,22 +5,115 @@ library;
 
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'libusb_bindings.g.dart';
 
 import '../usb_interface.dart';
 import '../usb_types.dart';
+import 'libusb_event_loop.dart';
 import 'native_library.dart';
 import 'usb_native_descriptors.dart';
 
-const int _defaultTimeoutMs = 5000;
+/// How [NativeUsbBackend] issues bulk/control transfers.
+enum UsbTransferMode {
+  /// Blocking libusb calls (`libusb_bulk_transfer` / `libusb_control_transfer`)
+  /// run synchronously on the calling isolate's thread. Simple, but a transfer
+  /// that idles until its timeout blocks that isolate for the whole duration.
+  sync,
+
+  /// Asynchronous libusb (`libusb_submit_transfer` + a dedicated event thread).
+  /// The calling isolate only submits and then `await`s a completion, never
+  /// blocking in native code - mirrors WebUSB semantics.
+  asyncEvents,
+}
+
+/// Bundle of per-device settings the backend injects into every
+/// [NativeUsbDevice] it creates, so the device constructor doesn't have to
+/// grow a parameter per knob.
+class _NativeDeviceConfig {
+  const _NativeDeviceConfig({
+    required this.readTimeoutMs,
+    required this.writeTimeoutMs,
+    required this.controlTimeoutMs,
+    required this.transferMode,
+    required this.events,
+  });
+
+  /// Timeout for bulk IN transfers ([NativeUsbDevice.transferIn]).
+  final int readTimeoutMs;
+
+  /// Timeout for bulk OUT transfers ([NativeUsbDevice.transferOut]).
+  final int writeTimeoutMs;
+
+  /// Timeout for control transfers (both directions).
+  final int controlTimeoutMs;
+
+  final UsbTransferMode transferMode;
+
+  /// The async transfer engine, when [transferMode] is
+  /// [UsbTransferMode.asyncEvents]; otherwise `null`.
+  final LibusbEventLoop? events;
+}
 
 /// [UsbBackend] implementation backed by libusb-1.0.
 ///
 /// Requires the libusb-1.0 shared library to be installed on the host
 /// system; see [NativeLibusb.libraryPath] if it isn't found automatically.
 class NativeUsbBackend implements UsbBackend {
+  /// Default value for [readTimeout], [writeTimeout] and [controlTimeout].
+  static const Duration defaultTransferTimeout = Duration(seconds: 5);
+
+  /// [readTimeout] is the timeout for bulk IN transfers, [writeTimeout] for
+  /// bulk OUT transfers, [controlTimeout] for control transfers. Kept separate
+  /// so a caller can use a short idle-read timeout without also making writes
+  /// fail quickly on a busy device. A zero duration means "no timeout" (libusb
+  /// blocks indefinitely).
+  factory NativeUsbBackend({
+    Duration readTimeout = defaultTransferTimeout,
+    Duration writeTimeout = defaultTransferTimeout,
+    Duration controlTimeout = defaultTransferTimeout,
+    UsbTransferMode transferMode = UsbTransferMode.sync,
+  }) {
+    LibusbEventLoop? events;
+    if (transferMode == UsbTransferMode.asyncEvents) {
+      events = LibusbEventLoop.instance;
+      // Bumps the refcount synchronously; the helper isolate spins up in the
+      // background and the first transfer awaits it.
+      unawaited(events.acquire());
+    }
+    return NativeUsbBackend._(_NativeDeviceConfig(
+      readTimeoutMs: _clampMs(readTimeout),
+      writeTimeoutMs: _clampMs(writeTimeout),
+      controlTimeoutMs: _clampMs(controlTimeout),
+      transferMode: transferMode,
+      events: events,
+    ));
+  }
+
+  NativeUsbBackend._(this._deviceConfig);
+
+  static int _clampMs(Duration d) {
+    final ms = d.inMilliseconds;
+    return ms < 0 ? 0 : ms;
+  }
+
+  final _NativeDeviceConfig _deviceConfig;
+
+  bool _disposed = false;
+
+  /// Releases resources held by this backend. In [UsbTransferMode.asyncEvents]
+  /// this drops the backend's reference to the shared libusb event isolate,
+  /// shutting it down once no async backend is left. Safe to call more than
+  /// once; the backend must not be used afterwards.
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _watcher.dispose();
+    _deviceConfig.events?.release();
+  }
+
   LibUsbBindings get _lib => NativeLibusb.instance;
   Pointer<libusb_context> get _ctx => NativeLibusb.context;
 
@@ -52,7 +145,9 @@ class NativeUsbBackend implements UsbBackend {
             continue;
           }
           lib.libusb_ref_device(devicePtr);
-          devices.add(NativeUsbDevice._(devicePtr, descriptor, lib));
+          devices.add(
+            NativeUsbDevice._(devicePtr, descriptor, lib, _deviceConfig),
+          );
         }
       } finally {
         lib.libusb_free_device_list(list, 1);
@@ -150,6 +245,13 @@ class _DeviceWatcher {
     }
   }
 
+  void dispose() {
+    _timer?.cancel();
+    _timer = null;
+    _connected.close();
+    _disconnected.close();
+  }
+
   Future<void> _poll() async {
     List<UsbDevice> devices;
     try {
@@ -180,14 +282,19 @@ class _DeviceWatcher {
 /// Implements [Finalizable] so a [NativeFinalizer] can release the native
 /// `libusb_ref_device()` reference once this wrapper is garbage collected.
 class NativeUsbDevice implements UsbDevice, Finalizable {
-  NativeUsbDevice._(this._device, this._descriptor, this._lib) {
+  NativeUsbDevice._(this._device, this._descriptor, this._lib, this._config) {
     _finalizer.attach(this, _device.cast(), detach: this);
   }
 
   final Pointer<libusb_device> _device;
   final UsbDeviceDescriptor _descriptor;
   final LibUsbBindings _lib;
+  final _NativeDeviceConfig _config;
   Pointer<libusb_device_handle>? _handle;
+
+  /// In-flight async transfers, tracked so [close] can wait for them to drain
+  /// before `libusb_close` (which must not run with transfers in flight).
+  final Set<Future<void>> _outstanding = {};
 
   static final NativeFinalizer _finalizer =
       NativeFinalizer(NativeLibusb.unrefDeviceSymbol);
@@ -223,9 +330,44 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
   @override
   Future<void> close() async {
     final handle = _handle;
-    if (handle != null) {
-      _lib.libusb_close(handle);
-      _handle = null;
+    if (handle == null) return;
+
+    final events = _config.events;
+    if (events != null && _outstanding.isNotEmpty) {
+      events.cancelForHandle(handle.address);
+      // Wait for the cancellations to be delivered so their native buffers
+      // are freed; bounded so a wedged transfer can't hang teardown.
+      await Future.wait(_outstanding.map((f) => f.catchError((_) {})))
+          .timeout(const Duration(seconds: 1), onTimeout: () => const []);
+    }
+
+    _lib.libusb_close(handle);
+    _handle = null;
+  }
+
+  /// Runs [op] while registered in [_outstanding] so [close] can await it.
+  Future<T> _tracked<T>(Future<T> Function() op) {
+    final future = op();
+    final tracked = future.then((_) {}, onError: (_) {});
+    _outstanding.add(tracked);
+    tracked.whenComplete(() => _outstanding.remove(tracked));
+    return future;
+  }
+
+  static UsbTransferStatus _statusFromTransfer(int transferStatus) {
+    switch (transferStatus) {
+      case libusb_transfer_status.LIBUSB_TRANSFER_COMPLETED:
+        return UsbTransferStatus.ok;
+      case libusb_transfer_status.LIBUSB_TRANSFER_TIMED_OUT:
+        return UsbTransferStatus.timeout;
+      case libusb_transfer_status.LIBUSB_TRANSFER_CANCELLED:
+        return UsbTransferStatus.cancelled;
+      case libusb_transfer_status.LIBUSB_TRANSFER_STALL:
+        return UsbTransferStatus.stall;
+      case libusb_transfer_status.LIBUSB_TRANSFER_OVERFLOW:
+        return UsbTransferStatus.babble;
+      default:
+        return UsbTransferStatus.error;
     }
   }
 
@@ -297,7 +439,7 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
         setup.index,
         buffer.cast(),
         length,
-        _defaultTimeoutMs,
+        _config.controlTimeoutMs,
       );
       if (result < 0) {
         return UsbInTransferResult(
@@ -334,7 +476,7 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
         setup.index,
         buffer.cast(),
         data.length,
-        _defaultTimeoutMs,
+        _config.controlTimeoutMs,
       );
       if (result < 0) {
         return UsbOutTransferResult(
@@ -355,6 +497,28 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
   Future<UsbInTransferResult> transferIn(
     int endpointNumber,
     int length,
+  ) {
+    final events = _config.events;
+    if (events == null) return _transferInSync(endpointNumber, length);
+    final handle = _requireOpen();
+    return _tracked(() async {
+      final result = await events.submitBulk(
+        deviceHandleAddress: handle.address,
+        endpointAddress: endpointNumber,
+        isIn: true,
+        length: length,
+        timeoutMs: _config.readTimeoutMs,
+      );
+      return UsbInTransferResult(
+        status: _statusFromTransfer(result.status),
+        data: result.data ?? const <int>[],
+      );
+    });
+  }
+
+  Future<UsbInTransferResult> _transferInSync(
+    int endpointNumber,
+    int length,
   ) async {
     final handle = _requireOpen();
     final address =
@@ -368,7 +532,7 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
         buffer.cast(),
         length,
         transferredOut,
-        _defaultTimeoutMs,
+        _config.readTimeoutMs,
       );
       final transferred = transferredOut.value;
       final status = result == libusb_error.LIBUSB_SUCCESS
@@ -389,6 +553,30 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
   Future<UsbOutTransferResult> transferOut(
     int endpointNumber,
     List<int> data,
+  ) {
+    final events = _config.events;
+    if (events == null) return _transferOutSync(endpointNumber, data);
+    final handle = _requireOpen();
+    final bytes = data is Uint8List ? data : Uint8List.fromList(data);
+    return _tracked(() async {
+      final result = await events.submitBulk(
+        deviceHandleAddress: handle.address,
+        endpointAddress: endpointNumber,
+        isIn: false,
+        length: bytes.length,
+        timeoutMs: _config.writeTimeoutMs,
+        outData: bytes,
+      );
+      return UsbOutTransferResult(
+        status: _statusFromTransfer(result.status),
+        bytesWritten: result.actualLength < 0 ? 0 : result.actualLength,
+      );
+    });
+  }
+
+  Future<UsbOutTransferResult> _transferOutSync(
+    int endpointNumber,
+    List<int> data,
   ) async {
     final handle = _requireOpen();
     final address =
@@ -403,7 +591,7 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
         buffer.cast(),
         data.length,
         transferredOut,
-        _defaultTimeoutMs,
+        _config.writeTimeoutMs,
       );
       final status = result == libusb_error.LIBUSB_SUCCESS
           ? UsbTransferStatus.ok

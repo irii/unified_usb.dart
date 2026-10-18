@@ -70,6 +70,23 @@ class NativeLibusb {
   static DynamicLibrary? _dylib;
   static DynamicLibrary? _providedDylib;
   static Pointer<libusb_context>? _context;
+  static String? _resolvedLibraryPath;
+
+  /// The filesystem path/name that [DynamicLibrary.open] was actually called
+  /// with, once the library has been loaded. `null` if a [DynamicLibrary] was
+  /// supplied directly via [setDynamicLibrary] (no path is known). Used to
+  /// let a helper isolate load its own binding to the same shared library.
+  static String? get resolvedLibraryPath {
+    _ensureInitialized();
+    return _resolvedLibraryPath;
+  }
+
+  /// Address of the process-wide [context] pointer, for handing to another
+  /// isolate that must run the libusb event loop against the same context.
+  static int get contextAddress {
+    _ensureInitialized();
+    return _context!.address;
+  }
 
   /// Provide an already-loaded libusb-1.0 [DynamicLibrary] to use instead of
   /// letting [NativeLibusb] open one from [libraryPath] / [addSearchPaths] /
@@ -142,7 +159,9 @@ class NativeLibusb {
 
     final explicit = libraryPath;
     if (explicit != null) {
-      return DynamicLibrary.open(explicit);
+      final lib = DynamicLibrary.open(explicit);
+      _resolvedLibraryPath = explicit;
+      return lib;
     }
 
     final candidates = [..._additionalSearchPaths, ..._candidatePaths()];
@@ -157,7 +176,9 @@ class NativeLibusb {
     Object? lastError;
     for (final candidate in candidates) {
       try {
-        return DynamicLibrary.open(candidate);
+        final lib = DynamicLibrary.open(candidate);
+        _resolvedLibraryPath = candidate;
+        return lib;
       } catch (e) {
         lastError = e;
       }
