@@ -1,11 +1,15 @@
 /// Asynchronous libusb transfer engine used by [NativeUsbBackend] when
 /// constructed with `UsbTransferMode.asyncEvents`.
 ///
-/// A dedicated helper isolate owns all native transfer memory and runs the
-/// libusb event loop (`libusb_handle_events_timeout_completed`). Callers
-/// submit a transfer and `await` a [LibusbTransferResult]; the calling
-/// isolate never blocks inside a native call, which is what makes this behave
-/// like WebUSB instead of stalling a whole isolate on an idle read.
+/// Transfers are allocated, submitted, cancelled and freed directly on the
+/// calling isolate (`libusb_submit_transfer` / `libusb_cancel_transfer` are
+/// thread-safe). The only thing that needs another thread is the libusb event
+/// loop itself: a helper isolate sits blocked in
+/// `libusb_handle_events_completed`, and completions reach the calling isolate
+/// through a [NativeCallable.listener], which libusb may invoke from any
+/// thread. The calling isolate never blocks inside a native call, which is
+/// what makes this behave like WebUSB instead of stalling a whole isolate on
+/// an idle read.
 ///
 /// Only bulk transfers go through here. Control transfers are rare, short and
 /// not a bottleneck, so they stay on the synchronous path even in
@@ -19,17 +23,16 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import '../usb_types.dart';
 import 'libusb_bindings.g.dart';
 import 'libusb_transfer_struct.dart';
 import 'native_library.dart';
 
-/// How often (worst case) the helper isolate notices a newly submitted
-/// transfer or a completion while otherwise idle. A blocking libusb event
-/// wait of this length is used between poll iterations; completions that
-/// arrive sooner return immediately, so active streaming is not slowed by it.
-const int _eventWaitMs = 10;
+/// How long a shutdown waits for cancelled transfers to be delivered before
+/// giving up on them.
+const Duration _drainTimeout = Duration(seconds: 1);
 
-/// Result of an async bulk transfer, reported back to the submitting isolate.
+/// Result of an async bulk transfer.
 class LibusbTransferResult {
   const LibusbTransferResult(this.status, this.actualLength, this.data);
 
@@ -41,64 +44,8 @@ class LibusbTransferResult {
   final Uint8List? data;
 }
 
-// ---------------------------------------------------------------------------
-// Cross-isolate messages
-// ---------------------------------------------------------------------------
-
-class _InitMsg {
-  const _InitMsg(this.toBackend, this.contextAddress, this.libraryPath);
-  final SendPort toBackend;
-  final int contextAddress;
-  final String? libraryPath;
-}
-
-class _ReadyMsg {
-  const _ReadyMsg(this.toEvent);
-  final SendPort toEvent;
-}
-
-class _SubmitMsg {
-  const _SubmitMsg({
-    required this.seq,
-    required this.deviceHandleAddress,
-    required this.endpointAddress,
-    required this.isIn,
-    required this.length,
-    required this.timeoutMs,
-    required this.outData,
-  });
-  final int seq;
-  final int deviceHandleAddress;
-  final int endpointAddress;
-  final bool isIn;
-  final int length;
-  final int timeoutMs;
-  final Uint8List? outData;
-}
-
-class _CancelMsg {
-  const _CancelMsg(this.deviceHandleAddress);
-  final int deviceHandleAddress;
-}
-
-class _ResultMsg {
-  const _ResultMsg(this.seq, this.status, this.actualLength, this.data);
-  final int seq;
-  final int status;
-  final int actualLength;
-  final Uint8List? data;
-}
-
-class _ShutdownMsg {
-  const _ShutdownMsg();
-}
-
-// ---------------------------------------------------------------------------
-// Backend-isolate side
-// ---------------------------------------------------------------------------
-
 /// Per-isolate singleton. Reference-counted by the [NativeUsbBackend]s that
-/// use it; the helper isolate is spawned on first [acquire] and torn down
+/// use it; the event isolate is spawned on first [acquire] and torn down
 /// when the last user calls [release].
 class LibusbEventLoop {
   LibusbEventLoop._();
@@ -106,77 +53,64 @@ class LibusbEventLoop {
   static LibusbEventLoop? _instance;
   static LibusbEventLoop get instance => _instance ??= LibusbEventLoop._();
 
+  LibUsbBindings get _lib => NativeLibusb.instance;
+
   int _refCount = 0;
-  Isolate? _isolate;
-  SendPort? _toEvent;
-  ReceivePort? _fromEvent;
-  Future<void>? _starting;
+  NativeCallable<LibusbTransferCallbackNative>? _callback;
+  Future<_EventThread>? _thread;
 
-  int _nextSeq = 1;
-  final Map<int, Completer<LibusbTransferResult>> _pending = {};
+  /// Completes once the previous event isolate (if any) has exited, so a
+  /// re-[acquire] during a shutdown doesn't run two event loops at once.
+  Future<void> _stopped = Future.value();
 
-  Future<void> acquire() async {
-    _refCount++;
-    await _ensureStarted();
+  /// transfer address -> in-flight transfer bookkeeping.
+  final Map<int, _InFlight> _inFlight = {};
+
+  /// Throws a [UsbException] if libusb was supplied via
+  /// [NativeLibusb.setDynamicLibrary]: the event isolate has to open the
+  /// library itself, which needs its path.
+  void acquire() {
+    if (_refCount == 0 && NativeLibusb.resolvedLibraryPath == null) {
+      throw UsbException(
+        'UsbTransferMode.asyncEvents needs libusb loaded from a path '
+        '(NativeLibusb.libraryPath or the default search), not via '
+        'NativeLibusb.setDynamicLibrary().',
+      );
+    }
+    if (_refCount++ > 0) return;
+    _callback = NativeCallable<LibusbTransferCallbackNative>.listener(
+      _onTransferComplete,
+    );
+    _thread = _stopped.then((_) => _EventThread.spawn());
   }
 
   void release() {
-    if (_refCount == 0) return;
-    _refCount--;
-    if (_refCount == 0) {
-      _toEvent?.send(const _ShutdownMsg());
-      _isolate?.kill(priority: Isolate.beforeNextEvent);
-      _isolate = null;
-      _toEvent = null;
-      _fromEvent?.close();
-      _fromEvent = null;
-      _starting = null;
-      for (final c in _pending.values) {
-        if (!c.isCompleted) {
-          c.complete(const LibusbTransferResult(
-            libusb_transfer_status.LIBUSB_TRANSFER_CANCELLED,
-            0,
-            null,
-          ));
-        }
-      }
-      _pending.clear();
+    if (_refCount == 0 || --_refCount > 0) return;
+    final callback = _callback!;
+    final thread = _thread!;
+    _callback = null;
+    _thread = null;
+
+    final draining = [for (final t in _inFlight.values) t.done.future];
+    for (final t in _inFlight.values) {
+      _lib.libusb_cancel_transfer(t.transfer.cast());
     }
+    _stopped = _shutdown(thread, callback, draining);
   }
 
-  Future<void> _ensureStarted() {
-    return _starting ??= _start();
-  }
-
-  Future<void> _start() async {
-    final fromEvent = ReceivePort();
-    _fromEvent = fromEvent;
-    final ready = Completer<SendPort>();
-
-    fromEvent.listen((msg) {
-      if (msg is _ReadyMsg) {
-        if (!ready.isCompleted) ready.complete(msg.toEvent);
-      } else if (msg is _ResultMsg) {
-        final c = _pending.remove(msg.seq);
-        c?.complete(LibusbTransferResult(
-          msg.status,
-          msg.actualLength,
-          msg.data,
-        ));
-      }
-    });
-
-    _isolate = await Isolate.spawn(
-      _eventIsolateMain,
-      _InitMsg(
-        fromEvent.sendPort,
-        NativeLibusb.contextAddress,
-        NativeLibusb.resolvedLibraryPath,
-      ),
-      debugName: 'libusb-events',
-    );
-
-    _toEvent = await ready.future;
+  Future<void> _shutdown(
+    Future<_EventThread> thread,
+    NativeCallable<LibusbTransferCallbackNative> callback,
+    List<Future<void>> draining,
+  ) async {
+    final events = await thread;
+    final drained = await Future.wait(draining)
+        .then((_) => true)
+        .timeout(_drainTimeout, onTimeout: () => false);
+    await events.stop();
+    // libusb must never call a closed callable. If a transfer is wedged, leak
+    // the callable (and the transfer) rather than risk that.
+    if (drained) callback.close();
   }
 
   /// Submits a bulk transfer and completes when libusb reports it done. The
@@ -189,20 +123,60 @@ class LibusbEventLoop {
     required int timeoutMs,
     Uint8List? outData,
   }) async {
-    await _ensureStarted();
-    final seq = _nextSeq++;
-    final completer = Completer<LibusbTransferResult>();
-    _pending[seq] = completer;
-    _toEvent!.send(_SubmitMsg(
-      seq: seq,
-      deviceHandleAddress: deviceHandleAddress,
-      endpointAddress: endpointAddress,
-      isIn: isIn,
+    final callback = _callback;
+    if (callback == null) {
+      throw StateError('LibusbEventLoop.submitBulk() called without acquire()');
+    }
+    final failed = LibusbTransferResult(
+      libusb_transfer_status.LIBUSB_TRANSFER_ERROR,
+      0,
+      isIn ? Uint8List(0) : null,
+    );
+
+    final transfer = _lib.libusb_alloc_transfer(0).cast<LibusbTransfer>();
+    if (transfer == nullptr) return failed;
+
+    final buffer = calloc<Uint8>(length <= 0 ? 1 : length);
+    if (!isIn && outData != null) {
+      buffer.asTypedList(outData.length).setAll(0, outData);
+    }
+
+    final direction = isIn
+        ? libusb_endpoint_direction.LIBUSB_ENDPOINT_IN
+        : libusb_endpoint_direction.LIBUSB_ENDPOINT_OUT;
+    transfer.fillBulk(
+      deviceHandle: Pointer<Void>.fromAddress(deviceHandleAddress),
+      endpointAddress: (endpointAddress & 0x0F) | direction,
+      buffer: buffer,
       length: length,
+      callback: callback.nativeFunction,
+      userData: 0,
       timeoutMs: timeoutMs,
-      outData: outData,
-    ));
-    return completer.future;
+    );
+
+    final entry = _InFlight(transfer, deviceHandleAddress);
+    _inFlight[transfer.address] = entry;
+    try {
+      if (_lib.libusb_submit_transfer(transfer.cast()) !=
+          libusb_error.LIBUSB_SUCCESS) {
+        _inFlight.remove(transfer.address);
+        return failed;
+      }
+      await entry.done.future;
+
+      // libusb doesn't touch the transfer after its callback returns, so its
+      // fields and buffer are ours to read until we free them.
+      final t = transfer.ref;
+      final actual = t.actualLength < 0 ? 0 : t.actualLength;
+      return LibusbTransferResult(
+        t.status,
+        t.actualLength,
+        isIn ? Uint8List.fromList(buffer.asTypedList(actual)) : null,
+      );
+    } finally {
+      _lib.libusb_free_transfer(transfer.cast());
+      calloc.free(buffer);
+    }
   }
 
   /// Requests cancellation of every in-flight transfer targeting the given
@@ -210,179 +184,69 @@ class LibusbEventLoop {
   /// status once libusb delivers the cancellation. Called before
   /// `libusb_close`, which must not run while transfers are in flight.
   void cancelForHandle(int deviceHandleAddress) {
-    _toEvent?.send(_CancelMsg(deviceHandleAddress));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helper-isolate side
-// ---------------------------------------------------------------------------
-
-void _eventIsolateMain(_InitMsg init) {
-  _EventIsolate(init).run();
-}
-
-class _EventIsolate {
-  _EventIsolate(this._init);
-
-  final _InitMsg _init;
-
-  late final LibUsbBindings _lib;
-  late final Pointer<libusb_context> _ctx;
-  late final NativeCallable<LibusbTransferCallbackNative> _callback;
-
-  final ReceivePort _commands = ReceivePort();
-  final Pointer<timeval> _tv = calloc<timeval>();
-  final Pointer<Int> _completed = calloc<Int>();
-
-  /// seq -> in-flight transfer bookkeeping. `seq` is also stored as the
-  /// transfer's `user_data`, so the C completion callback can recover it.
-  final Map<int, _InFlight> _inFlight = {};
-
-  bool _pumpScheduled = false;
-  bool _shuttingDown = false;
-
-  void run() {
-    _lib = NativeLibusb.instance;
-    _ctx = Pointer<libusb_context>.fromAddress(_init.contextAddress);
-    _callback = NativeCallable<LibusbTransferCallbackNative>.isolateLocal(
-      _onTransferComplete,
-    );
-    _tv.ref
-      ..tv_sec = 0
-      ..tv_usec = _eventWaitMs * 1000;
-
-    _commands.listen(_handleCommand);
-    _init.toBackend.send(_ReadyMsg(_commands.sendPort));
-  }
-
-  void _handleCommand(dynamic msg) {
-    if (msg is _SubmitMsg) {
-      _submit(msg);
-    } else if (msg is _CancelMsg) {
-      for (final entry in _inFlight.values) {
-        if (entry.deviceHandleAddress == msg.deviceHandleAddress) {
-          _lib.libusb_cancel_transfer(entry.transfer.cast());
-        }
+    for (final t in _inFlight.values) {
+      if (t.deviceHandleAddress == deviceHandleAddress) {
+        _lib.libusb_cancel_transfer(t.transfer.cast());
       }
-    } else if (msg is _ShutdownMsg) {
-      _shutdown();
     }
-  }
-
-  void _submit(_SubmitMsg msg) {
-    final transfer = _lib.libusb_alloc_transfer(0).cast<LibusbTransfer>();
-    if (transfer == nullptr) {
-      _init.toBackend.send(_ResultMsg(
-        msg.seq,
-        libusb_transfer_status.LIBUSB_TRANSFER_ERROR,
-        0,
-        msg.isIn ? Uint8List(0) : null,
-      ));
-      return;
-    }
-
-    final bufLen = msg.length <= 0 ? 1 : msg.length;
-    final buffer = calloc<Uint8>(bufLen);
-    if (!msg.isIn && msg.outData != null) {
-      buffer.asTypedList(msg.outData!.length).setAll(0, msg.outData!);
-    }
-
-    final address = msg.isIn
-        ? (msg.endpointAddress & 0x0F) | libusb_endpoint_direction.LIBUSB_ENDPOINT_IN
-        : (msg.endpointAddress & 0x0F) |
-            libusb_endpoint_direction.LIBUSB_ENDPOINT_OUT;
-
-    transfer.fillBulk(
-      deviceHandle: Pointer<Void>.fromAddress(msg.deviceHandleAddress),
-      endpointAddress: address,
-      buffer: buffer,
-      length: msg.length,
-      callback: _callback.nativeFunction,
-      userData: msg.seq,
-      timeoutMs: msg.timeoutMs,
-    );
-
-    _inFlight[msg.seq] =
-        _InFlight(transfer, buffer, msg.isIn, msg.deviceHandleAddress);
-
-    final rc = _lib.libusb_submit_transfer(transfer.cast());
-    if (rc != libusb_error.LIBUSB_SUCCESS) {
-      _inFlight.remove(msg.seq);
-      _lib.libusb_free_transfer(transfer.cast());
-      calloc.free(buffer);
-      _init.toBackend.send(_ResultMsg(
-        msg.seq,
-        libusb_transfer_status.LIBUSB_TRANSFER_ERROR,
-        0,
-        msg.isIn ? Uint8List(0) : null,
-      ));
-      return;
-    }
-
-    _schedulePump();
   }
 
   void _onTransferComplete(Pointer<LibusbTransfer> transfer) {
-    final t = transfer.ref;
-    final seq = t.userData.address;
-    final entry = _inFlight.remove(seq);
-    final status = t.status;
-    final actual = t.actualLength;
-
-    Uint8List? data;
-    if (entry != null && entry.isIn) {
-      final n = actual < 0 ? 0 : actual;
-      data = Uint8List(n)..setAll(0, entry.buffer.asTypedList(n));
-    }
-
-    _lib.libusb_free_transfer(transfer.cast());
-    if (entry != null) calloc.free(entry.buffer);
-
-    _init.toBackend.send(_ResultMsg(seq, status, actual, data));
-  }
-
-  void _schedulePump() {
-    if (_pumpScheduled || _shuttingDown) return;
-    _pumpScheduled = true;
-    Timer.run(_pump);
-  }
-
-  void _pump() {
-    _pumpScheduled = false;
-    if (_shuttingDown) return;
-
-    // Blocks up to `_eventWaitMs`, but returns as soon as any event (a
-    // completion) is handled, so back-to-back transfers are not throttled.
-    _lib.libusb_handle_events_timeout_completed(_ctx, _tv, _completed);
-
-    if (_inFlight.isNotEmpty) _schedulePump();
-  }
-
-  void _shutdown() {
-    _shuttingDown = true;
-    for (final entry in _inFlight.values) {
-      _lib.libusb_cancel_transfer(entry.transfer.cast());
-    }
-    // Give libusb a brief chance to fire the cancellation callbacks so the
-    // native allocations are freed rather than leaked on the way out.
-    _lib.libusb_handle_events_timeout_completed(_ctx, _tv, _completed);
-    for (final entry in _inFlight.values) {
-      _lib.libusb_free_transfer(entry.transfer.cast());
-      calloc.free(entry.buffer);
-    }
-    _inFlight.clear();
-    _callback.close();
-    calloc.free(_tv);
-    calloc.free(_completed);
-    _commands.close();
+    _inFlight.remove(transfer.address)?.done.complete();
   }
 }
 
 class _InFlight {
-  _InFlight(this.transfer, this.buffer, this.isIn, this.deviceHandleAddress);
+  _InFlight(this.transfer, this.deviceHandleAddress);
   final Pointer<LibusbTransfer> transfer;
-  final Pointer<Uint8> buffer;
-  final bool isIn;
   final int deviceHandleAddress;
+  final Completer<void> done = Completer<void>();
+}
+
+/// The helper isolate that runs the libusb event loop.
+class _EventThread {
+  _EventThread._(this._stopFlag, this._exit);
+
+  /// Doubles as the `completed` argument of `libusb_handle_events_completed`:
+  /// setting it to 1 (plus an interrupt) makes the event isolate return.
+  final Pointer<Int> _stopFlag;
+  final ReceivePort _exit;
+
+  static Future<_EventThread> spawn() async {
+    final stopFlag = calloc<Int>();
+    final exit = ReceivePort();
+    await Isolate.spawn(
+      _eventIsolateMain,
+      (
+        NativeLibusb.contextAddress,
+        stopFlag.address,
+        NativeLibusb.resolvedLibraryPath!,
+      ),
+      onExit: exit.sendPort,
+      debugName: 'libusb-events',
+    );
+    return _EventThread._(stopFlag, exit);
+  }
+
+  Future<void> stop() async {
+    _stopFlag.value = 1;
+    NativeLibusb.instance.libusb_interrupt_event_handler(NativeLibusb.context);
+    await _exit.first;
+    calloc.free(_stopFlag);
+  }
+}
+
+/// Event isolate entry point. Opens its own binding to the already loaded
+/// library (the same shared object, so the same process-wide libusb state)
+/// but deliberately not via [NativeLibusb], which would `libusb_init` a
+/// second, unused context in this isolate.
+void _eventIsolateMain((int, int, String) args) {
+  final (contextAddress, stopFlagAddress, libraryPath) = args;
+  final ctx = Pointer<libusb_context>.fromAddress(contextAddress);
+  final stopFlag = Pointer<Int>.fromAddress(stopFlagAddress);
+  final lib = LibUsbBindings(DynamicLibrary.open(libraryPath));
+
+  while (stopFlag.value == 0) {
+    lib.libusb_handle_events_completed(ctx, stopFlag);
+  }
 }

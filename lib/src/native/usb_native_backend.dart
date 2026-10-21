@@ -78,10 +78,9 @@ class NativeUsbBackend implements UsbBackend {
   }) {
     LibusbEventLoop? events;
     if (transferMode == UsbTransferMode.asyncEvents) {
-      events = LibusbEventLoop.instance;
-      // Bumps the refcount synchronously; the helper isolate spins up in the
-      // background and the first transfer awaits it.
-      unawaited(events.acquire());
+      // The event isolate spins up in the background; transfers submitted
+      // before it is running are simply picked up once it is.
+      events = LibusbEventLoop.instance..acquire();
     }
     return NativeUsbBackend._(_NativeDeviceConfig(
       readTimeoutMs: _clampMs(readTimeout),
