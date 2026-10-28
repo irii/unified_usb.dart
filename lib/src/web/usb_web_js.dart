@@ -82,7 +82,7 @@ extension type USBDevice._(JSObject _) implements JSObject {
   );
   external JSPromise<USBOutTransferResult> controlTransferOut(
     USBControlTransferParameters setup,
-    JSDataView? data,
+    JSDataView data,
   );
   external JSPromise<USBInTransferResult> transferIn(
     int endpointNumber,

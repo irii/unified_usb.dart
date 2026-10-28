@@ -25,6 +25,9 @@ class WebUsbBackend implements UsbBackend {
   bool get requestDeviceRequired => true;
 
   @override
+  bool get kernelDriverDetachSupported => false;
+
+  @override
   Future<List<UsbDevice>> getDevices({
     List<UsbDeviceFilter> filters = const [],
   }) async {
@@ -212,7 +215,7 @@ class WebUsbDevice implements UsbDevice {
     List<int> data,
   ) async {
     try {
-      final view = data.isEmpty ? null : js.bytesToJSDataView(data);
+      final view = js.bytesToJSDataView(data);
       final result =
           await _device.controlTransferOut(_toJsSetup(setup), view).toDart;
       return _outResultFromJs(result);
@@ -250,6 +253,27 @@ class WebUsbDevice implements UsbDevice {
 
   @override
   Future<void> reset() => _run('reset', () => _device.reset());
+
+  // The browser owns kernel driver binding; WebUSB exposes no way to change it.
+  static Never _kernelDriverUnsupported() => throw const UsbException(
+        'Kernel driver detach is not supported by WebUSB.',
+      );
+
+  @override
+  Future<bool> isKernelDriverActive(int interfaceNumber) async =>
+      _kernelDriverUnsupported();
+
+  @override
+  Future<void> detachKernelDriver(int interfaceNumber) async =>
+      _kernelDriverUnsupported();
+
+  @override
+  Future<void> attachKernelDriver(int interfaceNumber) async =>
+      _kernelDriverUnsupported();
+
+  @override
+  Future<void> setAutoDetachKernelDriver(bool enable) async =>
+      _kernelDriverUnsupported();
 
   Future<void> _run(String name, JSPromise<JSAny?> Function() call) async {
     try {

@@ -18,8 +18,9 @@ const int _maxStringDescriptorLength = 256;
 /// missing permissions) and leaving those fields `null` in that case.
 UsbDeviceDescriptor readDeviceDescriptor(
   LibUsbBindings lib,
-  Pointer<libusb_device> device,
-) {
+  Pointer<libusb_device> device, {
+  Pointer<libusb_device_handle>? openHandle,
+}) {
   final descPtr = calloc<libusb_device_descriptor>();
   try {
     final result = lib.libusb_get_device_descriptor(device, descPtr);
@@ -34,28 +35,35 @@ UsbDeviceDescriptor readDeviceDescriptor(
     String? productName;
     String? serialNumber;
 
-    final handleOut = calloc<Pointer<libusb_device_handle>>();
-    try {
-      if (lib.libusb_open(device, handleOut) == libusb_error.LIBUSB_SUCCESS) {
-        final handle = handleOut.value;
-        try {
-          manufacturerName = _readStringDescriptor(
-            lib,
-            handle,
-            desc.iManufacturer,
-          );
-          productName = _readStringDescriptor(lib, handle, desc.iProduct);
-          serialNumber = _readStringDescriptor(
-            lib,
-            handle,
-            desc.iSerialNumber,
-          );
-        } finally {
-          lib.libusb_close(handle);
+    void readStrings(Pointer<libusb_device_handle> handle) {
+      manufacturerName = _readStringDescriptor(
+        lib,
+        handle,
+        desc.iManufacturer,
+      );
+      productName = _readStringDescriptor(lib, handle, desc.iProduct);
+      serialNumber = _readStringDescriptor(lib, handle, desc.iSerialNumber);
+    }
+
+    if (openHandle != null) {
+      // Already open (e.g. a wrapped system device that libusb cannot
+      // open by itself).
+      readStrings(openHandle);
+    } else {
+      final handleOut = calloc<Pointer<libusb_device_handle>>();
+      try {
+        if (lib.libusb_open(device, handleOut) ==
+            libusb_error.LIBUSB_SUCCESS) {
+          final handle = handleOut.value;
+          try {
+            readStrings(handle);
+          } finally {
+            lib.libusb_close(handle);
+          }
         }
+      } finally {
+        calloc.free(handleOut);
       }
-    } finally {
-      calloc.free(handleOut);
     }
 
     return UsbDeviceDescriptor(

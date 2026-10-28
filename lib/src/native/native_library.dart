@@ -58,6 +58,14 @@ class NativeLibusb {
 
   static final List<String> _additionalSearchPaths = [];
 
+  /// Whether libusb scans the system for devices. Set to `false` before the
+  /// first call touching the native backend on platforms where apps may not
+  /// enumerate USB devices themselves (Android without root): libusb is then
+  /// initialized with `LIBUSB_OPTION_NO_DEVICE_DISCOVERY`, [NativeUsbBackend.
+  /// getDevices] returns nothing, and devices are opened by the platform and
+  /// handed over via [NativeUsbBackend.wrapSystemDevice].
+  static bool deviceDiscovery = true;
+
   /// Extra candidate paths/names to try (in [paths] order) before the
   /// built-in per-platform defaults, e.g. a location bundled alongside the
   /// app or a non-standard install directory. Call this before the first
@@ -134,6 +142,20 @@ class NativeLibusb {
 
     final dylib = _open();
     final libusb = LibUsbBindings(dylib);
+
+    if (!deviceDiscovery) {
+      // A NULL context sets the default for contexts created afterwards.
+      final result = libusb.libusb_set_option(
+        nullptr,
+        libusb_option.LIBUSB_OPTION_NO_DEVICE_DISCOVERY,
+      );
+      if (result != libusb_error.LIBUSB_SUCCESS) {
+        throw UsbException(
+          'libusb_set_option(NO_DEVICE_DISCOVERY) failed: '
+          '${libusbErrorName(result)}',
+        );
+      }
+    }
 
     final ctxOut = calloc<Pointer<libusb_context>>();
     try {

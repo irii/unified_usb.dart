@@ -10,6 +10,7 @@ A unified USB API for Dart — works both natively (desktop/CLI, via libusb) and
 - List, open, and claim interfaces on USB devices
 - Control, bulk, and interrupt transfers
 - One codebase, two backends: native (libusb) and web (WebUSB)
+- Kernel driver detach/attach (native only; check `backend.kernelDriverDetachSupported`)
 
 ## Native transfer mode
 

@@ -120,6 +120,9 @@ class NativeUsbBackend implements UsbBackend {
   bool get requestDeviceRequired => false;
 
   @override
+  bool get kernelDriverDetachSupported => _kernelDriverDetachSupported(_lib);
+
+  @override
   Future<List<UsbDevice>> getDevices({
     List<UsbDeviceFilter> filters = const [],
   }) async {
@@ -154,6 +157,39 @@ class NativeUsbBackend implements UsbBackend {
       return devices;
     } finally {
       calloc.free(listOut);
+    }
+  }
+
+  /// Wraps a device the platform has already opened, e.g. the file
+  /// descriptor of an Android `UsbDeviceConnection`
+  /// (`connection.getFileDescriptor()`). The returned device is already
+  /// open; [UsbDevice.close] releases the libusb handle but not
+  /// [fileDescriptor], which stays owned by the platform.
+  ///
+  /// libusb: `libusb_wrap_sys_device`. Typically used together with
+  /// [NativeLibusb.deviceDiscovery] set to `false`.
+  UsbDevice wrapSystemDevice(int fileDescriptor) {
+    final lib = _lib;
+    final handleOut = calloc<Pointer<libusb_device_handle>>();
+    try {
+      final result = lib.libusb_wrap_sys_device(_ctx, fileDescriptor, handleOut);
+      if (result != libusb_error.LIBUSB_SUCCESS) {
+        throw UsbException(
+          'libusb_wrap_sys_device() failed: ${libusbErrorName(result)}',
+        );
+      }
+      final handle = handleOut.value;
+      final devicePtr = lib.libusb_get_device(handle);
+      lib.libusb_ref_device(devicePtr);
+      final descriptor = readDeviceDescriptor(
+        lib,
+        devicePtr,
+        openHandle: handle,
+      );
+      return NativeUsbDevice._(devicePtr, descriptor, lib, _deviceConfig)
+        .._handle = handle;
+    } finally {
+      calloc.free(handleOut);
     }
   }
 
@@ -202,6 +238,12 @@ class NativeUsbBackend implements UsbBackend {
 
   late final _DeviceWatcher _watcher = _DeviceWatcher(this);
 }
+
+bool _kernelDriverDetachSupported(LibUsbBindings lib) =>
+    lib.libusb_has_capability(
+      libusb_capability.LIBUSB_CAP_SUPPORTS_DETACH_KERNEL_DRIVER,
+    ) !=
+    0;
 
 /// Polls [NativeUsbBackend.getDevices] on an interval and diffs the result
 /// to synthesize connect/disconnect events.
@@ -314,6 +356,8 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
 
   @override
   Future<void> open() async {
+    // Already open, e.g. created by [NativeUsbBackend.wrapSystemDevice].
+    if (_handle != null) return;
     final handleOut = calloc<Pointer<libusb_device_handle>>();
     try {
       final result = _lib.libusb_open(_device, handleOut);
@@ -614,6 +658,66 @@ class NativeUsbDevice implements UsbDevice, Finalizable {
         result != libusb_error.LIBUSB_ERROR_NOT_FOUND) {
       throw UsbException('reset() failed: ${libusbErrorName(result)}');
     }
+  }
+
+  @override
+  Future<bool> isKernelDriverActive(int interfaceNumber) async {
+    final handle = _requireKernelDriverSupport();
+    final result = _lib.libusb_kernel_driver_active(handle, interfaceNumber);
+    if (result < 0) {
+      throw UsbException(
+        'isKernelDriverActive() failed: ${libusbErrorName(result)}',
+      );
+    }
+    return result == 1;
+  }
+
+  @override
+  Future<void> detachKernelDriver(int interfaceNumber) async {
+    final handle = _requireKernelDriverSupport();
+    final result = _lib.libusb_detach_kernel_driver(handle, interfaceNumber);
+    // NOT_FOUND: no kernel driver bound, nothing to detach.
+    if (result != libusb_error.LIBUSB_SUCCESS &&
+        result != libusb_error.LIBUSB_ERROR_NOT_FOUND) {
+      throw UsbException(
+        'detachKernelDriver() failed: ${libusbErrorName(result)}',
+      );
+    }
+  }
+
+  @override
+  Future<void> attachKernelDriver(int interfaceNumber) async {
+    final handle = _requireKernelDriverSupport();
+    final result = _lib.libusb_attach_kernel_driver(handle, interfaceNumber);
+    // BUSY: a kernel driver is already bound.
+    if (result != libusb_error.LIBUSB_SUCCESS &&
+        result != libusb_error.LIBUSB_ERROR_BUSY) {
+      throw UsbException(
+        'attachKernelDriver() failed: ${libusbErrorName(result)}',
+      );
+    }
+  }
+
+  @override
+  Future<void> setAutoDetachKernelDriver(bool enable) async {
+    final handle = _requireKernelDriverSupport();
+    final result =
+        _lib.libusb_set_auto_detach_kernel_driver(handle, enable ? 1 : 0);
+    if (result != libusb_error.LIBUSB_SUCCESS) {
+      throw UsbException(
+        'setAutoDetachKernelDriver() failed: ${libusbErrorName(result)}',
+      );
+    }
+  }
+
+  Pointer<libusb_device_handle> _requireKernelDriverSupport() {
+    final handle = _requireOpen();
+    if (!_kernelDriverDetachSupported(_lib)) {
+      throw const UsbException(
+        'Kernel driver detach is not supported on this platform.',
+      );
+    }
+    return handle;
   }
 
   static UsbTransferStatus _statusFromError(int result) {

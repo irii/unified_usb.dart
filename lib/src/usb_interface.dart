@@ -3,10 +3,10 @@
 ///  - libusb (native, e.g. via dart:ffi) — desktop/mobile/CLI
 ///  - WebUSB (`navigator.usb`, via package:web/dart:js_interop) — browser
 ///
-/// Only the intersection of what both APIs can express is exposed here.
-/// Anything libusb-only (e.g. kernel driver detach) or WebUSB-only (e.g.
-/// user-gesture device chooser) belongs in backend-specific extensions, not
-/// in this shared surface.
+/// Mostly the intersection of what both APIs can express is exposed here.
+/// Backend-specific features that callers commonly need (e.g. kernel driver
+/// detach) are included behind a capability flag on [UsbBackend] so callers
+/// can check support up front instead of depending on a concrete backend.
 library;
 
 import 'usb_types.dart';
@@ -96,6 +96,34 @@ abstract class UsbDevice {
   ///
   /// libusb: `libusb_reset_device`. WebUSB: `USBDevice.reset()`.
   Future<void> reset();
+
+  /// Whether a kernel driver is currently bound to [interfaceNumber].
+  ///
+  /// libusb: `libusb_kernel_driver_active`. Throws [UsbException] if
+  /// [UsbBackend.kernelDriverDetachSupported] is `false`.
+  Future<bool> isKernelDriverActive(int interfaceNumber);
+
+  /// Detaches the kernel driver bound to [interfaceNumber] so the interface
+  /// can be claimed. A no-op if no kernel driver is bound.
+  ///
+  /// libusb: `libusb_detach_kernel_driver`. Throws [UsbException] if
+  /// [UsbBackend.kernelDriverDetachSupported] is `false`.
+  Future<void> detachKernelDriver(int interfaceNumber);
+
+  /// Re-attaches the kernel driver previously detached from
+  /// [interfaceNumber]. A no-op if a kernel driver is already bound.
+  ///
+  /// libusb: `libusb_attach_kernel_driver`. Throws [UsbException] if
+  /// [UsbBackend.kernelDriverDetachSupported] is `false`.
+  Future<void> attachKernelDriver(int interfaceNumber);
+
+  /// Enables/disables automatic kernel driver handling: when enabled, the
+  /// kernel driver is detached on [claimInterface] and re-attached on
+  /// [releaseInterface].
+  ///
+  /// libusb: `libusb_set_auto_detach_kernel_driver`. Throws [UsbException]
+  /// if [UsbBackend.kernelDriverDetachSupported] is `false`.
+  Future<void> setAutoDetachKernelDriver(bool enable);
 }
 
 /// Optional filter used to narrow device enumeration/selection, mirroring
@@ -132,6 +160,14 @@ abstract class UsbBackend {
   /// [getDevices] already enumerates everything the process may access and
   /// [requestDevice] just forwards to enumeration + filtering.
   bool get requestDeviceRequired;
+
+  /// Whether [UsbDevice.detachKernelDriver] and related kernel driver calls
+  /// are supported on this platform.
+  ///
+  /// libusb: `libusb_has_capability(LIBUSB_CAP_SUPPORTS_DETACH_KERNEL_DRIVER)`
+  /// (Linux, and macOS with sufficient privileges on recent libusb).
+  /// WebUSB: always `false` — the browser manages kernel drivers itself.
+  bool get kernelDriverDetachSupported;
 
   /// Lists devices already accessible without prompting the user.
   ///
