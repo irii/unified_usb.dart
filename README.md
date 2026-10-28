@@ -27,6 +27,9 @@ similar to WebUSB. Call `backend.dispose()` when finished so the helper
 isolate is torn down. Control
 transfers remain synchronous in both modes.
 
+## TODO's before pub release
+- Async libusb implementation
+
 ## Regenerating native bindings
 
 Only needed if you're changing the native backend itself. Point the generator
